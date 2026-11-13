@@ -1,0 +1,34 @@
+
+name: Extract OMEGA APEX Archive
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract archive
+        run: |
+          test -f omega-apex-v1.3.zip
+          rm -rf extracted
+          mkdir -p extracted
+          unzip -q omega-apex-v1.3.zip -d extracted
+          find extracted -type f | sort
+
+      - name: Commit extracted source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C omega-apex-source
+          git add extracted/
+          git commit -m "Extract OMEGA APEX v1.3 source"
+          git push -u origin omega-apex-source
+          
