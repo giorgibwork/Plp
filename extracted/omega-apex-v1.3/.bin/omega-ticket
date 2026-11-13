@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""
+omega-ticket: Repaired Mission & Ticket Engine with Constrained Typed Verification (v1.3)
+Security & Integrity Guarantees (Section 6 & Section 7 of v1.3 Directive):
+  - ZERO `shell=True` calls anywhere in verification, reconciliation, or execution.
+  - Rejects any string command or shell metacharacters (; | & $ ( ) ` > <) in `success_check`.
+  - Evaluates only structured `TypedCheckSpec` dictionaries:
+      1. `file_exists`: path exists inside workspace boundary
+      2. `file_sha256`: exact SHA-256 digest match of a workspace file
+      3. `json_valid`: strict JSON parsing + required keys check
+      4. `yaml_valid`: strict YAML parsing via yaml.safe_load + expected top-level type (`list` or `dict`)
+      5. `config_key_equals`: structured lookup in JSON or YAML without code execution
+      6. `test_result_present`: verifies structured test report JSON has passed >= min_passed and failed == 0
+      7. `allowlisted_readonly_validator`: executes ONLY fixed allowlisted Python scripts in .bin/ via
+         `subprocess.run([sys.executable, fixed_path], shell=False)` with zero user-supplied arguments.
+  - Enforces immutable contract digest (`immutable_contract_sha256`) after leaving `DRAFT` to detect ticket tampering.
+  - Enforces T0-T3 consistency with PREPARE_ONLY (T3 tickets cannot transition to `RUNNING` without a verified
+    out-of-band policy decision from `omega-policy`).
+  - Enforces bounded retries (`retry_count <= max_retries`), expiration (`expires_at`), and idempotent recovery.
+"""
+from __future__ import annotations
+import argparse
+import datetime as dt
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import yaml
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+TICKETS_DIR = ROOT_DIR / "operations" / "TICKETS"
+MISSIONS_DIR = ROOT_DIR / "operations" / "MISSIONS"
+TICKETS_DIR.mkdir(parents=True, exist_ok=True)
+MISSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+SHELL_META_RE = re.compile(r"[;|&$`><\n\r]")
+
+VALID_STATES = {
+    "DRAFT", "AWAITING_INPUT", "READY", "AWAITING_APPROVAL", "RUNNING",
+    "VERIFYING", "VERIFIED", "READY_FOR_REVIEW", "ACCEPTED",
+    "BLOCKED", "FAILED", "CANCELLED", "EXPIRED"
+}
+
+ALLOWED_TRANSITIONS = {
+    "DRAFT": {"AWAITING_INPUT", "READY", "CANCELLED"},
+    "AWAITING_INPUT": {"READY", "BLOCKED", "CANCELLED"},
+    "READY": {"RUNNING", "AWAITING_APPROVAL", "BLOCKED", "CANCELLED"},
+    "AWAITING_APPROVAL": {"RUNNING", "BLOCKED", "CANCELLED", "EXPIRED"},
+    "RUNNING": {"VERIFYING", "BLOCKED", "FAILED", "CANCELLED", "EXPIRED"},
+    "VERIFYING": {"VERIFIED", "BLOCKED", "FAILED"},
+    "VERIFIED": {"READY_FOR_REVIEW", "ACCEPTED"},
+    "READY_FOR_REVIEW": {"ACCEPTED", "BLOCKED", "FAILED"},
+    "BLOCKED": {"READY", "AWAITING_APPROVAL", "CANCELLED"},
+    "FAILED": {"READY", "CANCELLED"},
+    "ACCEPTED": set(),
+    "CANCELLED": set(),
+    "EXPIRED": set(),
+}
+
+ALLOWLISTED_VALIDATORS = {
+    "spr-verify": ROOT_DIR / ".bin" / "spr-verify",
+}
+
+def now_utc() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+def now_iso() -> str:
+    return now_utc().isoformat()
+
+def compute_immutable_digest(t: dict) -> str:
+    core = {
+        "ticket_id": t["ticket_id"],
+        "mission_id": t["mission_id"],
+        "objective": t["objective"],
+        "risk_class": t["risk_class"],
+        "typed_success_check": t["typed_success_check"],
+    }
+    raw = json.dumps(core, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+def safe_workspace_path(rel_or_abs: str) -> Path:
+    if SHELL_META_RE.search(rel_or_abs):
+        raise ValueError(f"Rejected path containing shell metacharacters: {rel_or_abs}")
+    p = (ROOT_DIR / rel_or_abs).resolve() if not os.path.isabs(rel_or_abs) else Path(rel_or_abs).resolve()
+    p.relative_to(ROOT_DIR.resolve())
+    return p
+
+def evaluate_typed_check(spec: dict) -> tuple[bool, str]:
+    """Deterministically evaluates a TypedCheckSpec without shell execution."""
+    if not isinstance(spec, dict):
+        return False, "REJECTED_UNTYPED_CHECK: typed_success_check must be a structured dict, never a raw shell string."
+    check_type = spec.get("type", "")
+    if SHELL_META_RE.search(str(check_type)):
+        return False, "REJECTED_METACHARACTER_IN_CHECK_TYPE"
+
+    try:
+        if check_type == "file_exists":
+            p = safe_workspace_path(str(spec["path"]))
+            ok = p.is_file()
+            return ok, f"file_exists({p.relative_to(ROOT_DIR)}) -> {ok}"
+
+        if check_type == "file_sha256":
+            p = safe_workspace_path(str(spec["path"]))
+            if not p.is_file():
+                return False, f"file_sha256: file missing ({spec['path']})"
+            actual = hashlib.sha256(p.read_bytes()).hexdigest()
+            expected = str(spec["expected_sha256"]).replace("sha256:", "")
+            ok = (actual == expected)
+            return ok, f"file_sha256({p.relative_to(ROOT_DIR)}): actual={actual[:12]} expected={expected[:12]} -> {ok}"
+
+        if check_type == "json_valid":
+            p = safe_workspace_path(str(spec["path"]))
+            data = json.loads(p.read_text(encoding="utf-8"))
+            req_keys = spec.get("required_keys", [])
+            missing = [k for k in req_keys if k not in data]
+            ok = len(missing) == 0
+            return ok, f"json_valid({p.relative_to(ROOT_DIR)}): missing_keys={missing} -> {ok}"
+
+        if check_type == "yaml_valid":
+            p = safe_workspace_path(str(spec["path"]))
+            parsed = yaml.safe_load(p.read_text(encoding="utf-8"))
+            exp_type = spec.get("expected_top_type", "list")
+            if exp_type == "list":
+                ok = isinstance(parsed, list) and len(parsed) > 0
+            elif exp_type == "dict":
+                ok = isinstance(parsed, dict) and len(parsed) > 0
+            else:
+                ok = parsed is not None
+            return ok, f"yaml_valid({p.relative_to(ROOT_DIR)}, top={type(parsed).__name__}) -> {ok}"
+
+        if check_type == "config_key_equals":
+            p = safe_workspace_path(str(spec["path"]))
+            raw = p.read_text(encoding="utf-8")
+            data = yaml.safe_load(raw) if p.suffix in (".yml", ".yaml") else json.loads(raw)
+            key_path = str(spec["key_path"]).split(".")
+            cur = data
+            for part in key_path:
+                if isinstance(cur, list):
+                    # Support matching item by id in a Cordis patch list
+                    matched = [item for item in cur if isinstance(item, dict) and str(item.get("id")) == part]
+                    cur = matched[0] if matched else None
+                elif isinstance(cur, dict):
+                    cur = cur.get(part)
+                else:
+                    cur = None
+                if cur is None:
+                    break
+            ok = (cur == spec.get("expected_value"))
+            return ok, f"config_key_equals({spec['key_path']} == {spec.get('expected_value')}, actual={cur}) -> {ok}"
+
+        if check_type == "test_result_present":
+            p = safe_workspace_path(str(spec["path"]))
+            data = json.loads(p.read_text(encoding="utf-8"))
+            passed = int(data.get("passed_tests", 0))
+            failed = int(data.get("failed_tests", 1))
+            min_p = int(spec.get("min_passed", 1))
+            max_f = int(spec.get("max_failed", 0))
+            ok = (passed >= min_p and failed <= max_f)
+            return ok, f"test_result_present(passed={passed}>={min_p}, failed={failed}<={max_f}) -> {ok}"
+
+        if check_type == "allowlisted_readonly_validator":
+            val_name = str(spec.get("validator", ""))
+            if val_name not in ALLOWLISTED_VALIDATORS:
+                return False, f"Validator '{val_name}' is not in ALLOWLISTED_VALIDATORS."
+            script_path = ALLOWLISTED_VALIDATORS[val_name]
+            proc = subprocess.run(
+                [sys.executable, str(script_path)],
+                cwd=str(ROOT_DIR),
+                shell=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            ok = (proc.returncode == 0)
+            return ok, f"allowlisted_readonly_validator({val_name}) exit={proc.returncode}"
+
+        return False, f"Unsupported TypedCheckSpec type: '{check_type}'"
+    except Exception as exc:
+        return False, f"TypedCheckSpec evaluation error ({type(exc).__name__}): {exc}"
+
+def load_ticket(ticket_id: str) -> dict:
+    p = TICKETS_DIR / f"{ticket_id}.json"
+    if not p.exists():
+        raise FileNotFoundError(f"Ticket not found: {ticket_id}")
+    t = json.loads(p.read_text(encoding="utf-8"))
+    # Verify immutability lock if ticket has left DRAFT
+    if t.get("current_state") != "DRAFT":
+        expected = t.get("immutable_contract_sha256", "")
+        actual = compute_immutable_digest(t)
+        if expected != actual:
+            raise ValueError(f"TICKET_TAMPER_DETECTED on {ticket_id}: stored digest {expected} != computed {actual}")
+    return t
+
+def save_ticket(t: dict) -> None:
+    p = TICKETS_DIR / f"{t['ticket_id']}.json"
+    p.write_text(json.dumps(t, indent=2) + "\n", encoding="utf-8")
+
+def create_ticket(
+    ticket_id: str,
+    mission_id: str,
+    objective: str,
+    typed_success_check: dict,
+    risk_class: str = "T1",
+    max_retries: int = 2,
+    ttl_seconds: int = 3600,
+) -> dict:
+    if not isinstance(typed_success_check, dict) or "type" not in typed_success_check:
+        raise ValueError("typed_success_check must be a dict with a 'type' key.")
+    # Reject any shell command injection inside typed_success_check values
+    for k, v in typed_success_check.items():
+        if isinstance(v, str) and SHELL_META_RE.search(v):
+            raise ValueError(f"Rejected shell metacharacter in typed_success_check[{k}]: {v}")
+
+    if risk_class not in ("T0", "T1", "T2", "T3"):
+        raise ValueError(f"Invalid risk_class: {risk_class}")
+
+    now = now_utc()
+    t = {
+        "ticket_id": ticket_id,
+        "mission_id": mission_id,
+        "objective": objective,
+        "risk_class": risk_class,
+        "typed_success_check": typed_success_check,
+        "current_state": "READY",
+        "verification_status": "unverified",
+        "retry_count": 0,
+        "max_retries": max_retries,
+        "executed_step_nonces": [],
+        "evidence_references": [],
+        "checkpoints": [],
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
+        "expires_at": (now + dt.timedelta(seconds=ttl_seconds)).isoformat(),
+        "stopping_reason": None,
+    }
+    t["immutable_contract_sha256"] = compute_immutable_digest(t)
+    save_ticket(t)
+    return t
+
+def transition_ticket(
+    ticket_id: str,
+    target_state: str,
+    actor: str = "omega_coordinator",
+    reason: str = "",
+    step_nonce: str = "",
+) -> dict:
+    t = load_ticket(ticket_id)
+    cur = t["current_state"]
+
+    # Check expiration first
+    exp_dt = dt.datetime.fromisoformat(t["expires_at"])
+    if now_utc() >= exp_dt and cur not in ("VERIFIED", "ACCEPTED", "CANCELLED", "EXPIRED"):
+        t["current_state"] = "EXPIRED"
+        t["stopping_reason"] = f"Ticket expired at {t['expires_at']}"
+        save_ticket(t)
+        raise RuntimeError(t["stopping_reason"])
+
+    # Hard block on direct transition to VERIFIED or ACCEPTED without running verify_ticket
+    if target_state in ("VERIFIED", "ACCEPTED") and t.get("verification_status") != "verified":
+        raise PermissionError(f"Cannot transition {ticket_id} to {target_state} while verification_status='{t.get('verification_status')}'. Run verify first.")
+
+    if target_state not in ALLOWED_TRANSITIONS.get(cur, set()):
+        raise ValueError(f"Invalid state transition {cur} -> {target_state}")
+
+    # T2/T3 authority check: T3 consequential tickets CANNOT enter RUNNING under PREPARE_ONLY without verified OOB policy
+    if t["risk_class"] == "T3" and target_state == "RUNNING":
+        t["current_state"] = "BLOCKED"
+        t["stopping_reason"] = "T3 consequential operation blocked under PREPARE_ONLY (no out-of-band host approval channel)."
+        save_ticket(t)
+        raise PermissionError(t["stopping_reason"])
+
+    # Duplicate step execution prevention
+    if step_nonce:
+        if step_nonce in t["executed_step_nonces"]:
+            raise RuntimeError(f"DUPLICATE_EXECUTION_PREVENTED: step_nonce '{step_nonce}' already executed on {ticket_id}.")
+        t["executed_step_nonces"].append(step_nonce)
+
+    t["current_state"] = target_state
+    t["updated_at"] = now_iso()
+    t["checkpoints"].append({
+        "from": cur,
+        "to": target_state,
+        "actor": actor,
+        "reason": reason,
+        "timestamp": now_iso(),
+    })
+    save_ticket(t)
+    return t
+
+def verify_ticket(ticket_id: str, verifier_actor: str = "deterministic_typed_verifier") -> dict:
+    t = load_ticket(ticket_id)
+    exp_dt = dt.datetime.fromisoformat(t["expires_at"])
+    if now_utc() >= exp_dt:
+        t["current_state"] = "EXPIRED"
+        t["stopping_reason"] = "Ticket expired before verification."
+        save_ticket(t)
+        return {"verified": False, "state": "EXPIRED", "detail": t["stopping_reason"]}
+
+    ok, detail = evaluate_typed_check(t["typed_success_check"])
+    evidence_entry = {
+        "verifier_actor": verifier_actor,
+        "check_type": t["typed_success_check"].get("type"),
+        "passed": ok,
+        "detail": detail,
+        "timestamp": now_iso(),
+    }
+    t["evidence_references"].append(evidence_entry)
+
+    if ok:
+        t["verification_status"] = "verified"
+        t["current_state"] = "VERIFIED"
+        t["stopping_reason"] = "Acceptance criteria verified deterministically."
+    else:
+        t["retry_count"] = int(t.get("retry_count", 0)) + 1
+        t["verification_status"] = "failed"
+        if t["retry_count"] > int(t.get("max_retries", 2)):
+            t["current_state"] = "BLOCKED"
+            t["stopping_reason"] = f"Exceeded max_retries ({t['max_retries']}): {detail}"
+        else:
+            t["current_state"] = "FAILED"
+            t["stopping_reason"] = f"Verification check failed (retry {t['retry_count']}/{t['max_retries']}): {detail}"
+    t["updated_at"] = now_iso()
+    save_ticket(t)
+    return {
+        "ticket_id": ticket_id,
+        "verified": ok,
+        "state": t["current_state"],
+        "retry_count": t["retry_count"],
+        "detail": detail,
+    }
+
+def reconcile_ticket(ticket_id: str) -> dict:
+    """Idempotent recovery after interruption: runs read-only typed check without duplicating mutations."""
+    t = load_ticket(ticket_id)
+    ok, detail = evaluate_typed_check(t["typed_success_check"])
+    if ok and t["current_state"] not in ("VERIFIED", "ACCEPTED"):
+        t["verification_status"] = "verified"
+        t["current_state"] = "VERIFIED"
+        t["stopping_reason"] = "Recovered via idempotent read-only reconciliation."
+        t["checkpoints"].append({
+            "from": "INTERRUPTED",
+            "to": "VERIFIED",
+            "actor": "omega_reconciler",
+            "reason": detail,
+            "timestamp": now_iso(),
+        })
+        save_ticket(t)
+    return {
+        "ticket_id": ticket_id,
+        "already_satisfied": ok,
+        "current_state": t["current_state"],
+        "detail": detail,
+    }
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="OMEGA APEX v1.3 Typed Ticket & Mission Engine")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    c_p = sub.add_parser("create")
+    c_p.add_argument("--id", required=True)
+    c_p.add_argument("--mission", default="MSN-V13-FOUNDATION")
+    c_p.add_argument("--objective", required=True)
+    c_p.add_argument("--check-json", required=True, help="JSON dict of TypedCheckSpec")
+    c_p.add_argument("--risk", choices=["T0", "T1", "T2", "T3"], default="T1")
+    c_p.add_argument("--max-retries", type=int, default=2)
+    c_p.add_argument("--ttl", type=int, default=3600)
+
+    t_p = sub.add_parser("transition")
+    t_p.add_argument("--id", required=True)
+    t_p.add_argument("--to", required=True)
+    t_p.add_argument("--actor", default="omega_coordinator")
+    t_p.add_argument("--reason", default="")
+    t_p.add_argument("--nonce", default="")
+
+    v_p = sub.add_parser("verify")
+    v_p.add_argument("--id", required=True)
+
+    r_p = sub.add_parser("reconcile")
+    r_p.add_argument("--id", required=True)
+
+    args = parser.parse_args()
+    try:
+        if args.cmd == "create":
+            spec = json.loads(args.check_json)
+            res = create_ticket(args.id, args.mission, args.objective, spec, args.risk, args.max_retries, args.ttl)
+            print(json.dumps(res, indent=2))
+        elif args.cmd == "transition":
+            res = transition_ticket(args.id, args.to, args.actor, args.reason, args.nonce)
+            print(json.dumps(res, indent=2))
+        elif args.cmd == "verify":
+            res = verify_ticket(args.id)
+            print(json.dumps(res, indent=2))
+            if not res["verified"]:
+                sys.exit(1)
+        elif args.cmd == "reconcile":
+            res = reconcile_ticket(args.id)
+            print(json.dumps(res, indent=2))
+    except Exception as exc:
+        print(json.dumps({"error": type(exc).__name__, "message": str(exc)}, indent=2), file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

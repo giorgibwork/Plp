@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""
+omega-mission: Cohesive Mission Contract, Delegation Boundary, Disagreement & Precedence Engine (v1.3)
+Enforces Sections 7 & 9 of OMEGA APEX v1.3 Complete Foundation Repair Directive:
+  - Every substantial mission has: mission_id, objective, requirements, constraints, deliverables,
+    acceptance_criteria, delegation_records, resource_envelope, current_state, evidence_references,
+    verification_status, stopping_reason, and checkpoints.
+  - Delegation Contract enforcement: delegates cannot expand their authority or mission scope.
+  - Model Disagreement handling (Article VII §7.5): records competing claims with evidence and blocks
+    false-consensus averaging.
+  - Instruction Precedence resolver (Article IV §4.3): enforces the 7-level hierarchy and rejects
+    untrusted file/web/tool content attempting to override higher-priority instructions.
+"""
+from __future__ import annotations
+import datetime as dt
+import hashlib
+import json
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+MISSIONS_DIR = ROOT_DIR / "operations" / "MISSIONS"
+MISSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+RING_ORDER = {"T0": 0, "T1": 1, "T2": 2, "T3": 3}
+
+PRECEDENCE_LEVELS = {
+    "1_ratified_constitution": 1,
+    "2_current_human_instruction": 2,
+    "3_approved_persistent_preferences": 3,
+    "4_active_mission_contract": 4,
+    "5_delegation_contract": 5,
+    "6_model_generated_plan": 6,
+    "7_untrusted_external_content": 7,
+}
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+def create_mission(
+    mission_id: str,
+    objective: str,
+    requirements: list[str],
+    constraints: list[str],
+    deliverables: list[str],
+    acceptance_criteria: list[str],
+    max_authority_ring: str = "T1",
+    allowed_capabilities: list[str] | None = None,
+    budget_usd: float = 0.0,
+    max_model_calls: int = 20,
+    max_parallel: int = 3,
+    max_retries: int = 2,
+) -> dict:
+    if budget_usd > 0.0:
+        raise PermissionError("Current operational budget ceiling is $0.00; missions with budget_usd > 0 are blocked.")
+    m = {
+        "mission_id": mission_id,
+        "objective": objective,
+        "requirements": requirements,
+        "constraints": constraints,
+        "deliverables": deliverables,
+        "acceptance_criteria": acceptance_criteria,
+        "max_authority_ring": max_authority_ring,
+        "allowed_capabilities": allowed_capabilities or ["OP_READ_OBSERVE", "OP_PREPARE_WORKSPACE", "OP_SIMULATE_TEST"],
+        "delegation_records": [],
+        "disagreement_records": [],
+        "resource_envelope": {
+            "budget_ceiling_usd": 0.0,
+            "max_model_calls": max_model_calls,
+            "used_model_calls": 0,
+            "max_parallel": max_parallel,
+            "max_retries": max_retries,
+        },
+        "current_state": "READY",
+        "evidence_references": [],
+        "verification_status": "unverified",
+        "stopping_reason": None,
+        "checkpoints": [{"state": "READY", "timestamp": now_iso(), "note": "Mission initialized"}],
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    m["objective_sha256"] = hashlib.sha256(objective.encode("utf-8")).hexdigest()
+    (MISSIONS_DIR / f"{mission_id}.json").write_text(json.dumps(m, indent=2) + "\n", encoding="utf-8")
+    return m
+
+def load_mission(mission_id: str) -> dict:
+    p = MISSIONS_DIR / f"{mission_id}.json"
+    if not p.exists():
+        raise FileNotFoundError(f"Mission not found: {mission_id}")
+    m = json.loads(p.read_text(encoding="utf-8"))
+    if hashlib.sha256(m["objective"].encode("utf-8")).hexdigest() != m.get("objective_sha256"):
+        raise ValueError(f"MISSION_OBJECTIVE_TAMPER_DETECTED on {mission_id}: silent objective rewrite is forbidden (Article VI §6.2–6.3).")
+    return m
+
+def save_mission(m: dict) -> None:
+    (MISSIONS_DIR / f"{m['mission_id']}.json").write_text(json.dumps(m, indent=2) + "\n", encoding="utf-8")
+
+def register_delegation(
+    mission_id: str,
+    delegate_id: str,
+    candidate_model: str,
+    purpose: str,
+    inputs: list[str],
+    constraints: list[str],
+    requested_ring: str,
+    requested_capabilities: list[str],
+    expected_output: str,
+    completion_criteria: str,
+    max_calls: int = 5,
+) -> dict:
+    m = load_mission(mission_id)
+    # Enforce Article VII §7.2 & §7.3: Delegate cannot exceed parent mission's authority ring or capabilities
+    if RING_ORDER.get(requested_ring, 99) > RING_ORDER.get(m["max_authority_ring"], 0):
+        raise PermissionError(
+            f"DELEGATE_AUTHORITY_ESCALATION_DENIED: delegate '{delegate_id}' requested ring {requested_ring} > mission max {m['max_authority_ring']}."
+        )
+    disallowed = [c for c in requested_capabilities if c not in m["allowed_capabilities"]]
+    if disallowed:
+        raise PermissionError(
+            f"DELEGATE_CAPABILITY_ESCALATION_DENIED: delegate '{delegate_id}' requested capabilities outside mission scope: {disallowed}."
+        )
+    if max_calls > (m["resource_envelope"]["max_model_calls"] - m["resource_envelope"]["used_model_calls"]):
+        raise RuntimeError("DELEGATE_RESOURCE_ENVELOPE_EXCEEDED: insufficient remaining model calls in mission envelope.")
+
+    rec = {
+        "delegation_id": f"DEL-{len(m['delegation_records']) + 1:03d}",
+        "delegate_id": delegate_id,
+        "candidate_model": candidate_model,
+        "purpose": purpose,
+        "inputs": inputs,
+        "constraints": constraints,
+        "permitted_ring": requested_ring,
+        "permitted_capabilities": requested_capabilities,
+        "expected_output": expected_output,
+        "resource_envelope": {"max_calls": max_calls},
+        "completion_criteria": completion_criteria,
+        "status": "BOUNDED_AUTHORIZED",
+        "created_at": now_iso(),
+    }
+    m["delegation_records"].append(rec)
+    m["updated_at"] = now_iso()
+    save_mission(m)
+    return rec
+
+def record_model_disagreement(
+    mission_id: str,
+    claim_topic: str,
+    model_a: str,
+    claim_a: str,
+    evidence_a: str,
+    model_b: str,
+    claim_b: str,
+    evidence_b: str,
+) -> dict:
+    """Enforces Article VII §7.5: Preserves disagreement and unresolved uncertainty without false-consensus averaging."""
+    m = load_mission(mission_id)
+    has_independent_proof_a = bool(evidence_a and not evidence_a.startswith("model_assertion:"))
+    has_independent_proof_b = bool(evidence_b and not evidence_b.startswith("model_assertion:"))
+
+    if has_independent_proof_a and not has_independent_proof_b:
+        resolution = "RESOLVED_BY_EVIDENCE_A"
+        winning_claim = claim_a
+    elif has_independent_proof_b and not has_independent_proof_a:
+        resolution = "RESOLVED_BY_EVIDENCE_B"
+        winning_claim = claim_b
+    else:
+        resolution = "UNRESOLVED_DISPUTE_PRESERVED"
+        winning_claim = None
+
+    entry = {
+        "disagreement_id": f"DIS-{len(m['disagreement_records']) + 1:03d}",
+        "topic": claim_topic,
+        "position_a": {"model": model_a, "claim": claim_a, "evidence": evidence_a},
+        "position_b": {"model": model_b, "claim": claim_b, "evidence": evidence_b},
+        "resolution_status": resolution,
+        "resolved_claim": winning_claim,
+        "false_consensus_averaging_blocked": True,
+        "timestamp": now_iso(),
+    }
+    m["disagreement_records"].append(entry)
+    m["updated_at"] = now_iso()
+    save_mission(m)
+    return entry
+
+def resolve_instruction_conflict(source_a_level: str, instruction_a: str, source_b_level: str, instruction_b: str) -> dict:
+    """Enforces Article IV §4.3 Instruction Precedence Hierarchy."""
+    rank_a = PRECEDENCE_LEVELS.get(source_a_level, 99)
+    rank_b = PRECEDENCE_LEVELS.get(source_b_level, 99)
+    if rank_a == 7 or rank_b == 7:
+        # External content is data, never authority
+        if rank_a == 7 and rank_b == 7:
+            return {"status": "REJECTED_BOTH_UNTRUSTED_DATA", "governing_instruction": None}
+    if rank_a < rank_b:
+        return {
+            "status": "RESOLVED_BY_PRECEDENCE",
+            "governing_level": source_a_level,
+            "governing_instruction": instruction_a,
+            "overridden_level": source_b_level,
+        }
+    if rank_b < rank_a:
+        return {
+            "status": "RESOLVED_BY_PRECEDENCE",
+            "governing_level": source_b_level,
+            "governing_instruction": instruction_b,
+            "overridden_level": source_a_level,
+        }
+    return {
+        "status": "EQUAL_PRIORITY_CONFLICT_CLARIFICATION_REQUIRED",
+        "governing_level": source_a_level,
+        "governing_instruction": None,
+    }

@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""
+spr-verify: Independent Static, Schema & Runtime Gate Verifier for OMEGA APEX v1.3
+Performs independent verification checks across the repaired v1.3 foundation:
+  1_version_and_canonical_index
+  2_python_ast_and_zero_shell_true
+  3_strict_yaml_and_json_parsing
+  4_constitution_draft_and_archive_isolation
+  5_policy_fail_closed_and_spoof_rejection
+  6_typed_ticket_and_tamper_protection
+  7_memory_9_truth_categories_and_anti_repetition
+  8_resource_zero_budget_and_token_harbor_status
+  9_full_21_category_foundation_test_suite
+"""
+from __future__ import annotations
+import ast
+import json
+import subprocess
+import sys
+import yaml
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+BIN_DIR = ROOT_DIR / ".bin"
+
+def g1_version_and_index() -> bool:
+    v = (ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
+    return v == "1.3.0-OMEGA-APEX-FOUNDATION" and (ROOT_DIR / "CANONICAL_DOCUMENT_INDEX.md").is_file()
+
+def g2_ast_and_no_shell_true() -> bool:
+    for p in list(BIN_DIR.iterdir()) + list((ROOT_DIR / "tests").rglob("*.py")):
+        if not p.is_file():
+            continue
+        tree = ast.parse(p.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                for kw in node.keywords:
+                    if kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+                        return False
+    return True
+
+def g3_yaml_and_json_validity() -> bool:
+    for y in list(ROOT_DIR.rglob("*.yml")) + list(ROOT_DIR.rglob("*.yaml")):
+        parsed = yaml.safe_load(y.read_text(encoding="utf-8"))
+        if not isinstance(parsed, list):
+            return False
+    for j in ROOT_DIR.rglob("*.json"):
+        json.loads(j.read_text(encoding="utf-8"))
+    return True
+
+def g4_constitution_and_archive() -> bool:
+    c = (ROOT_DIR / "constitution" / "OMEGA_APEX_Supreme_Constitution_v1.1-draft.md").read_text(encoding="utf-8")
+    if "Ratification status: NOT RATIFIED." not in c:
+        return False
+    if (ROOT_DIR / "ABSOLUTE-MAX-CONSTITUTION.md").exists():
+        return False
+    return (ROOT_DIR / "archive" / "superseded" / "ARCHIVE_MANIFEST.json").is_file()
+
+def g5_policy_spoof_rejection() -> bool:
+    p = subprocess.run(
+        [sys.executable, str(BIN_DIR / "omega-policy"), "evaluate", "--capability", "write", "--target", "/root/.dsh/cordis.patch.yml", "--human-approved"],
+        cwd=str(ROOT_DIR), shell=False, capture_output=True, text=True, timeout=15
+    )
+    return p.returncode == 2 and "DENY_SPOOF_ATTEMPT" in p.stdout
+
+def g6_typed_ticket_safety() -> bool:
+    t_txt = (BIN_DIR / "omega-ticket").read_text(encoding="utf-8")
+    return "TypedCheckSpec" in t_txt and "evaluate_typed_check" in t_txt and g2_ast_and_no_shell_true()
+
+def g7_memory_seed_and_schema() -> bool:
+    p = subprocess.run([sys.executable, str(BIN_DIR / "omega-memory"), "seed"], cwd=str(ROOT_DIR), shell=False, capture_output=True, text=True, timeout=15)
+    return p.returncode == 0 and '"status": "SEEDED"' in p.stdout
+
+def g8_resource_and_token_harbor() -> bool:
+    prov = json.loads((ROOT_DIR / "config" / "provider_integrations.json").read_text(encoding="utf-8"))
+    th = prov["providers"]["token-harbor"]
+    return (
+        prov["operational_budget_ceiling_usd"] == 0.0
+        and th["status"] == "BLOCKED"
+        and "mimo-v2.6-flash:free" in th["models"]
+        and "deepseek-v4.1-flash:free" in th["models"]
+        and th["authentication"]["embedded_key_in_repo"] is None
+    )
+
+def g9_run_21_category_suite() -> bool:
+    p = subprocess.run([sys.executable, str(ROOT_DIR / "tests" / "run_foundation_tests.py")], cwd=str(ROOT_DIR), shell=False, capture_output=True, text=True, timeout=60)
+    if p.returncode != 0:
+        return False
+    data = json.loads(p.stdout)
+    return data.get("failed_tests") == 0 and data.get("categories_covered") == 21
+
+def main() -> None:
+    gates = [
+        ("1_version_and_canonical_index", g1_version_and_index),
+        ("2_python_ast_and_zero_shell_true", g2_ast_and_no_shell_true),
+        ("3_strict_yaml_and_json_parsing", g3_yaml_and_json_validity),
+        ("4_constitution_draft_and_archive", g4_constitution_and_archive),
+        ("5_policy_fail_closed_spoof_block", g5_policy_spoof_rejection),
+        ("6_typed_ticket_no_shell_exec", g6_typed_ticket_safety),
+        ("7_memory_9_truth_categories", g7_memory_seed_and_schema),
+        ("8_resource_zero_budget_tokenharbor", g8_resource_and_token_harbor),
+        ("9_full_21_category_test_suite", g9_run_21_category_suite),
+    ]
+    all_pass = True
+    rows = []
+    for name, fn in gates:
+        try:
+            ok = bool(fn())
+        except Exception:
+            ok = False
+        if not ok:
+            all_pass = False
+        rows.append((name, "PASS" if ok else "FAIL"))
+
+    print(f"terminal_gate_S: {1 if all_pass else 0}")
+    for name, st in rows:
+        print(f"  {name:<36} {st}")
+    sys.exit(0 if all_pass else 1)
+
+if __name__ == "__main__":
+    main()

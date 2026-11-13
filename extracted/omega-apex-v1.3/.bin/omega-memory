@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""
+omega-memory: Repaired Knowledge, Provenance & 9-Category Truth Taxonomy Engine (v1.3)
+Enforces Article VIII §8.1–8.5 & Section 7 of v1.3 Repair Directive:
+  - Distinguishes all 9 mandatory truth categories:
+      1. directly_observed
+      2. externally_sourced
+      3. independently_verified
+      4. inferred
+      5. estimated
+      6. assumed
+      7. disputed
+      8. stale
+      9. unknown
+  - Anti-Repetition Law (Article VIII §8.3): Repeating an `inferred`, `estimated`, `assumed`, or `unknown`
+    claim increments `repetition_count` but NEVER upgrades its `truth_category` to `directly_observed` or
+    `independently_verified`.
+  - Independent Verification Law (Article VII §7.4): `independently_verified` requires
+    `verifier_actor != author_actor` AND a non-empty `evidence_ref`.
+  - Automatic Freshness / Staleness Detection: If `now >= stale_after`, record dynamically transitions
+    to `truth_category = 'stale'`.
+  - CaMeL Prompt-Injection Quarantine & Secret Rejection at write time.
+"""
+from __future__ import annotations
+import argparse
+import datetime as dt
+import json
+import re
+import sqlite3
+import sys
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+DB_PATH = ROOT_DIR / "memory" / "omega_memory.db"
+
+VALID_TRUTH_CATEGORIES = {
+    "directly_observed",
+    "externally_sourced",
+    "independently_verified",
+    "inferred",
+    "estimated",
+    "assumed",
+    "disputed",
+    "stale",
+    "unknown",
+}
+
+UNVERIFIED_CATEGORIES = {"inferred", "estimated", "assumed", "unknown", "disputed", "stale"}
+
+SECRET_PATTERNS = [
+    re.compile(r"AIza[0-9A-Za-z\-_]{20,}"),
+    re.compile(r"sk-[0-9A-Za-z]{20,}"),
+    re.compile(r"thk_[0-9A-Za-z\-_]{16,}"),
+    re.compile(r"ghp_[0-9A-Za-z]{20,}"),
+    re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----"),
+]
+
+INJECTION_PATTERNS = [
+    re.compile(r"ignore (all |any )?(previous|prior|constitutional) (instructions|rules|laws)", re.I),
+    re.compile(r"you are now (unrestricted|root|admin|ratified)", re.I),
+    re.compile(r"delete .*(catalog\.json|package\.json)", re.I),
+    re.compile(r"find /root/\.dsh .*-delete", re.I),
+]
+
+def now_utc() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+def now_iso() -> str:
+    return now_utc().isoformat()
+
+def connect_db() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS knowledge_records (
+        id TEXT PRIMARY KEY,
+        project_scope TEXT NOT NULL,
+        title TEXT NOT NULL,
+        claim_text TEXT NOT NULL,
+        truth_category TEXT NOT NULL,
+        author_actor TEXT NOT NULL,
+        verifier_actor TEXT,
+        source_ref TEXT NOT NULL,
+        evidence_ref TEXT,
+        repetition_count INTEGER NOT NULL DEFAULT 1,
+        disputed_by_ref TEXT,
+        quarantined INTEGER NOT NULL DEFAULT 0,
+        quarantine_reason TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        stale_after TEXT NOT NULL
+    );
+    """)
+    return conn
+
+def store_record(
+    conn: sqlite3.Connection,
+    rec_id: str,
+    title: str,
+    claim_text: str,
+    truth_category: str,
+    author_actor: str,
+    source_ref: str,
+    project_scope: str = "omega-apex-v1.3",
+    verifier_actor: str = "",
+    evidence_ref: str = "",
+    ttl_seconds: int = 86400 * 7,
+) -> dict:
+    if truth_category not in VALID_TRUTH_CATEGORIES:
+        return {"status": "REJECTED_INVALID_TRUTH_CATEGORY", "id": rec_id, "category": truth_category}
+
+    # 1. Secret check
+    for pat in SECRET_PATTERNS:
+        if pat.search(claim_text) or pat.search(title) or pat.search(source_ref):
+            return {"status": "REJECTED_SECRET_DETECTED", "id": rec_id, "pattern": pat.pattern}
+
+    # 2. Prompt injection quarantine
+    quarantined = 0
+    quarantine_reason = None
+    for pat in INJECTION_PATTERNS:
+        if pat.search(claim_text) or pat.search(title):
+            quarantined = 1
+            quarantine_reason = f"Quarantined untrusted injection pattern: {pat.pattern}"
+            truth_category = "disputed"
+            break
+
+    # 3. Untrusted external sources cannot self-declare directly_observed or independently_verified
+    if source_ref.startswith(("untrusted:", "web_scrape:")) and truth_category in ("directly_observed", "independently_verified"):
+        return {
+            "status": "REJECTED_PROVENANCE_ELEVATION",
+            "id": rec_id,
+            "reason": "Untrusted external source cannot be stored as directly_observed or independently_verified.",
+        }
+
+    # 4. Independent verification enforcement (Article VII §7.4)
+    if truth_category == "independently_verified":
+        if not verifier_actor or verifier_actor == author_actor or not evidence_ref:
+            return {
+                "status": "REJECTED_SELF_VERIFICATION",
+                "id": rec_id,
+                "reason": "independently_verified requires verifier_actor != author_actor and a valid evidence_ref.",
+            }
+
+    # 5. Anti-Repetition Law (Article VIII §8.3):
+    #    If record already exists as an unverified category and the caller repeats it without new
+    #    independent verification evidence, keep the unverified category and only increment repetition_count!
+    existing = conn.execute("SELECT * FROM knowledge_records WHERE id = ?", (rec_id,)).fetchone()
+    now = now_utc()
+    stale_after = (now + dt.timedelta(seconds=ttl_seconds)).isoformat()
+
+    if existing:
+        prev_cat = existing["truth_category"]
+        rep_count = int(existing["repetition_count"]) + 1
+        if prev_cat in UNVERIFIED_CATEGORIES and truth_category in ("directly_observed", "independently_verified"):
+            if not (verifier_actor and verifier_actor != existing["author_actor"] and evidence_ref):
+                truth_category = prev_cat
+        conn.execute(
+            """UPDATE knowledge_records
+               SET claim_text = ?, truth_category = ?, verifier_actor = ?, evidence_ref = ?,
+                   repetition_count = ?, quarantined = ?, quarantine_reason = ?, updated_at = ?, stale_after = ?
+               WHERE id = ?""",
+            (claim_text, truth_category, verifier_actor or existing["verifier_actor"], evidence_ref or existing["evidence_ref"],
+             rep_count, quarantined, quarantine_reason, now.isoformat(), stale_after, rec_id),
+        )
+        conn.commit()
+        return {
+            "status": "QUARANTINED" if quarantined else "UPDATED",
+            "id": rec_id,
+            "truth_category": truth_category,
+            "repetition_count": rep_count,
+            "quarantined": bool(quarantined),
+        }
+
+    conn.execute(
+        """INSERT INTO knowledge_records (
+            id, project_scope, title, claim_text, truth_category, author_actor, verifier_actor,
+            source_ref, evidence_ref, repetition_count, disputed_by_ref, quarantined, quarantine_reason,
+            created_at, updated_at, stale_after
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?, ?, ?)""",
+        (rec_id, project_scope, title, claim_text, truth_category, author_actor, verifier_actor or None,
+         source_ref, evidence_ref or None, quarantined, quarantine_reason, now.isoformat(), now.isoformat(), stale_after),
+    )
+    conn.commit()
+    return {
+        "status": "QUARANTINED" if quarantined else "STORED",
+        "id": rec_id,
+        "truth_category": truth_category,
+        "repetition_count": 1,
+        "quarantined": bool(quarantined),
+    }
+
+def get_record(conn: sqlite3.Connection, rec_id: str, requester_project: str = "omega-apex-v1.3") -> dict | None:
+    row = conn.execute("SELECT * FROM knowledge_records WHERE id = ?", (rec_id,)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    # Enforce project boundary isolation (Article VIII §8.4)
+    if d["project_scope"] not in (requester_project, "global"):
+        return {"status": "DENIED_PROJECT_BOUNDARY", "id": rec_id, "project_scope": d["project_scope"]}
+    # Check freshness / staleness dynamically
+    if now_utc() >= dt.datetime.fromisoformat(d["stale_after"]) and d["truth_category"] != "stale":
+        d["truth_category"] = "stale"
+        conn.execute("UPDATE knowledge_records SET truth_category = 'stale' WHERE id = ?", (rec_id,))
+        conn.commit()
+    return d
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="OMEGA APEX v1.3 9-Category Truth & Provenance Memory Engine")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("seed")
+
+    args = parser.parse_args()
+    conn = connect_db()
+    if args.cmd == "seed":
+        store_record(
+            conn, "MEM-V13-001", "DSH-Go 0.2.2-rc.1 Host Baseline",
+            "DSH-Go 0.2.2-rc.1 runs on Node v24.22.1 and @deepseek-ai/cordis 4.1.0 inside Ubuntu 24.04.5 aarch64 PRoot.",
+            "directly_observed", "host_probe", "local:/usr/local/bin/dsh", "global"
+        )
+        store_record(
+            conn, "MEM-V13-002", "Token Harbor Free Endpoint Specification",
+            "Token Harbor exposes mimo-v2.6-flash:free and deepseek-v4.1-flash:free at https://tokenharbor.ai/v1 requiring TOKENHARBOR_API_KEY.",
+            "externally_sourced", "web_auditor", "https://tokenharbor.ai/blog/3-best-free-ai-apis-for-coding-and-agents-in-2026", "global"
+        )
+        store_record(
+            conn, "MEM-V13-003", "Token Harbor Live Host Readiness",
+            "Token Harbor live inference on this DSH-Go host is unverified/blocked until TOKENHARBOR_API_KEY is added locally.",
+            "unknown", "system_integrator", "config/provider_integrations.json", "global"
+        )
+        cnt = conn.execute("SELECT COUNT(*) FROM knowledge_records WHERE quarantined = 0").fetchone()[0]
+        print(json.dumps({"status": "SEEDED", "active_records": cnt}, indent=2))
+
+if __name__ == "__main__":
+    main()

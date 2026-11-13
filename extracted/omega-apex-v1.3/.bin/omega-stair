@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""
+omega-stair: Repaired STAIR-MAX Structure-Aware ToC Prefix-Trie Retriever (v1.3)
+Indexes ONLY active canonical documents (excludes archive/superseded/* and generated reports/scoreboards)
+so obsolete/superseded drafts never compete with the active governing hierarchy.
+"""
+from __future__ import annotations
+import argparse
+import json
+import math
+import re
+import sys
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+TRIE_PATH = ROOT_DIR / "memory" / "omega_toc_trie.json"
+
+EXCLUDED_DIRS = {"archive", "reports", "receipts", "tests", ".git", "__pycache__"}
+
+STOPWORDS = {
+    "the", "a", "an", "and", "or", "of", "to", "in", "for", "on", "with", "by",
+    "is", "are", "be", "as", "at", "from", "that", "this", "what", "how", "why"
+}
+
+class TrieNode:
+    def __init__(self) -> None:
+        self.children: dict[str, TrieNode] = {}
+        self.is_end: bool = False
+
+def build_trie(titles: list[str]) -> TrieNode:
+    root = TrieNode()
+    for title in titles:
+        node = root
+        for ch in title:
+            if ch not in node.children:
+                node.children[ch] = TrieNode()
+            node = node.children[ch]
+        node.is_end = True
+    return root
+
+def is_complete(root: TrieNode, title: str) -> bool:
+    node = root
+    for ch in title:
+        if ch not in node.children:
+            return False
+        node = node.children[ch]
+    return node.is_end
+
+def constrain_to_trie(root: TrieNode, candidate: str, valid_titles: list[str]) -> str:
+    if is_complete(root, candidate):
+        return candidate
+    node = root
+    prefix_chars = []
+    for ch in candidate:
+        if ch in node.children:
+            prefix_chars.append(ch)
+            node = node.children[ch]
+        else:
+            break
+    while not node.is_end and node.children:
+        next_ch = sorted(node.children.keys())[0]
+        prefix_chars.append(next_ch)
+        node = node.children[next_ch]
+    projected = "".join(prefix_chars)
+    return projected if is_complete(root, projected) else (valid_titles[0] if valid_titles else "")
+
+def tokenize(text: str) -> list[str]:
+    return [t for t in re.findall(r"[a-z0-9_.-]+", text.lower()) if t not in STOPWORDS and len(t) > 1]
+
+def parse_markdown_hierarchy(md_path: Path, rel_doc: str) -> list[dict]:
+    lines = md_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    h1, h2, h3 = rel_doc, "", ""
+    sections: list[dict] = []
+    current_title = rel_doc
+    current_path = [rel_doc]
+    current_lines: list[str] = []
+    start_line = 1
+
+    def flush(end_line: int) -> None:
+        text_span = "\n".join(current_lines).strip()
+        if text_span:
+            full_addr = " > ".join(dict.fromkeys([p for p in current_path if p]))
+            sections.append({
+                "doc": rel_doc,
+                "leaf_title": current_title,
+                "hierarchical_address": full_addr,
+                "start_line": start_line,
+                "end_line": end_line,
+                "text_span": text_span,
+            })
+
+    for idx, line in enumerate(lines, start=1):
+        m = re.match(r"^(#{1,3})\s+(.+)$", line.strip())
+        if m:
+            flush(idx - 1)
+            level = len(m.group(1))
+            heading = m.group(2).strip()
+            if level == 1:
+                h1, h2, h3 = heading, "", ""
+                current_path = [rel_doc, h1]
+            elif level == 2:
+                h2, h3 = heading, ""
+                current_path = [rel_doc, h1, h2]
+            else:
+                h3 = heading
+                current_path = [rel_doc, h1, h2, h3]
+            current_title = heading
+            current_lines = [line]
+            start_line = idx
+        else:
+            current_lines.append(line)
+    flush(len(lines))
+    return sections
+
+def build_corpus_index() -> dict:
+    all_sections: list[dict] = []
+    for f in sorted(ROOT_DIR.rglob("*.md")):
+        rel_parts = f.relative_to(ROOT_DIR).parts
+        if any(p in EXCLUDED_DIRS for p in rel_parts):
+            continue
+        rel = str(f.relative_to(ROOT_DIR))
+        all_sections.extend(parse_markdown_hierarchy(f, rel))
+
+    leaf_counts: dict[str, int] = {}
+    for s in all_sections:
+        leaf_counts[s["leaf_title"]] = leaf_counts.get(s["leaf_title"], 0) + 1
+
+    for s in all_sections:
+        s["docid"] = s["hierarchical_address"] if leaf_counts[s["leaf_title"]] > 1 else f"{s['doc']} :: {s['leaf_title']}"
+
+    docids = [s["docid"] for s in all_sections]
+    payload = {
+        "version": "1.3.0-OMEGA-APEX",
+        "section_count": len(all_sections),
+        "unique_docids": len(set(docids)),
+        "archived_docs_excluded": True,
+        "docids": docids,
+        "sections": all_sections,
+    }
+    TRIE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    TRIE_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return payload
+
+def score_sections(index_payload: dict, query: str, top_k: int = 3) -> list[dict]:
+    q_tokens = tokenize(query)
+    sections = index_payload["sections"]
+    N = max(len(sections), 1)
+    df: dict[str, int] = {}
+    sec_toks = []
+    for s in sections:
+        tt = tokenize(s["hierarchical_address"] + " " + s["leaf_title"])
+        bt = tokenize(s["text_span"])
+        sec_toks.append((tt, bt))
+        for t in set(tt + bt):
+            df[t] = df.get(t, 0) + 1
+
+    scored = []
+    for s, (tt, bt) in zip(sections, sec_toks):
+        sc = 0.0
+        tset, bset = set(tt), set(bt)
+        for qt in q_tokens:
+            idf = math.log(1.0 + (N - df.get(qt, 0) + 0.5) / (df.get(qt, 0) + 0.5))
+            if qt in tset:
+                sc += 4.5 * idf
+            if qt in bset:
+                tf = bt.count(qt)
+                sc += 1.5 * idf * (tf / (tf + 1.2))
+            if qt in s["hierarchical_address"].lower():
+                sc += 3.0
+        scored.append((sc, s))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [{"score": round(sc, 4), **sec} for sc, sec in scored[:top_k]]
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="OMEGA APEX v1.3 STAIR-MAX Retriever")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("build")
+    q_p = sub.add_parser("query")
+    q_p.add_argument("question", type=str)
+    args = parser.parse_args()
+    if args.cmd == "build":
+        idx = build_corpus_index()
+        print(json.dumps({"status": "BUILT", "section_count": idx["section_count"], "archived_docs_excluded": True}, indent=2))
+    elif args.cmd == "query":
+        idx = json.loads(TRIE_PATH.read_text(encoding="utf-8")) if TRIE_PATH.exists() else build_corpus_index()
+        trie = build_trie(idx["docids"])
+        ranked = score_sections(idx, args.question, top_k=3)
+        out = []
+        for r in ranked:
+            cid = constrain_to_trie(trie, r["docid"], idx["docids"])
+            out.append({"docid": cid, "trie_verified": is_complete(trie, cid), "score": r["score"]})
+        print(json.dumps({"query": args.question, "results": out}, indent=2))
+
+if __name__ == "__main__":
+    main()

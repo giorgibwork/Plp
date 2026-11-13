@@ -1,0 +1,144 @@
+{
+  "schema_version": "1.3.0",
+  "operational_budget_ceiling_usd": 0.0,
+  "paid_routes_globally_disabled": true,
+  "providers": {
+    "token-harbor": {
+      "provider_id": "token-harbor",
+      "official_name": "Token Harbor Unified API Gateway",
+      "adapter_package": "@deepseek-ai/dsh-llm-pi-ai",
+      "endpoint_base_url": "https://tokenharbor.ai/v1",
+      "wire_protocol": "openai-chat-completions-v1",
+      "authentication": {
+        "method": "bearer_api_key",
+        "credential_env_var": "TOKENHARBOR_API_KEY",
+        "dsh_credential_store_path": "/root/.dsh/.credentials.yaml",
+        "key_prefix_expected": "thk_",
+        "embedded_key_in_repo": null
+      },
+      "status": "BLOCKED",
+      "blocker_reason": "Token Harbor requires a user-generated free API key (TOKENHARBOR_API_KEY, prefix 'thk_') from https://tokenharbor.ai stored in /root/.dsh/.credentials.yaml or environment, plus an on-device live connectivity test. Per Section 4 rules, no key is embedded or requested in chat, and this integration is marked BLOCKED until the operator provisions the local credential.",
+      "quota_structure": {
+        "allowance_type": "shared_account_weekly_free_allowance",
+        "separate_per_model_quota_verified": false,
+        "notes": "Token Harbor applies a weekly free usage cap across :free routes on the same account key (https://tokenharbor.ai/blog/3-best-free-ai-apis-for-coding-and-agents-in-2026)."
+      },
+      "models": {
+        "mimo-v2.6-flash:free": {
+          "exact_model_id": "mimo-v2.6-flash:free",
+          "catalog_url": "https://tokenharbor.ai/models/mimo-v2.6-flash:free",
+          "cost_per_1m_input_usd": 0.0,
+          "cost_per_1m_output_usd": 0.0,
+          "context_window_tokens": 1000000,
+          "max_output_tokens": 32000,
+          "modalities": [
+            "text",
+            "image",
+            "audio",
+            "video"
+          ],
+          "candidate_role": "candidate_primary_orchestrator_and_multimodal",
+          "qualification_status": "DOCUMENTED_API_BLOCKED_PENDING_KEY"
+        },
+        "deepseek-v4.1-flash:free": {
+          "exact_model_id": "deepseek-v4.1-flash:free",
+          "catalog_url": "https://tokenharbor.ai/models/deepseek-v4.1-flash:free",
+          "cost_per_1m_input_usd": 0.0,
+          "cost_per_1m_output_usd": 0.0,
+          "context_window_tokens": 1048576,
+          "max_output_tokens": 128000,
+          "modalities": [
+            "text",
+            "image"
+          ],
+          "candidate_role": "candidate_subagent_and_coding_specialist",
+          "qualification_status": "DOCUMENTED_API_BLOCKED_PENDING_KEY"
+        }
+      }
+    },
+    "our-free-model": {
+      "provider_id": "our-free-model",
+      "official_name": "Ebony-Vinyl/dsh-our-free-model (OpenCode Zen / Kilo Free Bridge)",
+      "adapter_package": "dsh-our-free-model",
+      "endpoint_base_url": "https://opencode.ai/inference/v1 (via plugin)",
+      "wire_protocol": "dsh-plugin-native",
+      "authentication": {
+        "method": "keyless_plugin_session",
+        "catalog_file": "/root/.dsh/our-free-model/catalog.json"
+      },
+      "status": "INSTALLED_MOUNTED_ON_HOST",
+      "quota_structure": {
+        "allowance_type": "unpublished_upstream_shared_free_cap",
+        "separate_per_model_quota_verified": false,
+        "notes": "OpenCode Zen enforces an unpublished shared free-tier cap across free models (https://sharkly.ai/blog/opencode-free-models/). Note that model IDs in this plugin use hyphens (-free) rather than Token Harbor colons (:free)."
+      },
+      "models": {
+        "mimo-v2.6-flash-free": {
+          "exact_model_id": "mimo-v2.6-flash-free",
+          "cost_per_1m_input_usd": 0.0,
+          "cost_per_1m_output_usd": 0.0,
+          "context_window_tokens": 200000,
+          "max_output_tokens": 32000,
+          "data_retention_policy": "may_train_on_prompts_during_free_promo",
+          "candidate_role": "candidate_primary_orchestrator",
+          "qualification_status": "OBSERVED_IN_HOST_CATALOG"
+        },
+        "deepseek-v4.1-flash-free": {
+          "exact_model_id": "deepseek-v4.1-flash-free",
+          "cost_per_1m_input_usd": 0.0,
+          "cost_per_1m_output_usd": 0.0,
+          "context_window_tokens": 200000,
+          "max_output_tokens": 32000,
+          "data_retention_policy": "zero_retention_documented",
+          "candidate_role": "candidate_subagent_worker",
+          "qualification_status": "OBSERVED_IN_HOST_CATALOG"
+        }
+      }
+    },
+    "google-antigravity": {
+      "provider_id": "google-antigravity",
+      "official_name": "Google Antigravity OAuth Plugin (suntianc/dsh-antigravity-auth@0.1.6)",
+      "adapter_package": "dsh-antigravity-auth",
+      "status": "INSTALLED_MOUNTED_ON_HOST",
+      "quota_structure": {
+        "allowance_type": "per_google_account_backend_rate_limit",
+        "separate_per_model_quota_verified": false,
+        "notes": "Fetched live from /v1internal:fetchAvailableModels with 30s in-memory TTL."
+      },
+      "models": {
+        "antigravity-gemini-3.7-flash": {
+          "exact_model_id": "antigravity-gemini-3.7-flash",
+          "cost_per_1m_input_usd": 0.0,
+          "cost_per_1m_output_usd": 0.0,
+          "context_window_tokens": 1000000,
+          "max_output_tokens": 64000,
+          "candidate_role": "candidate_long_context_fallback",
+          "qualification_status": "OBSERVED_OPERATIONAL_ON_HOST"
+        },
+        "antigravity-gemini-3.8-flash": {
+          "exact_model_id": "antigravity-gemini-3.8-flash",
+          "cost_per_1m_input_usd": 0.0,
+          "cost_per_1m_output_usd": 0.0,
+          "context_window_tokens": 1000000,
+          "max_output_tokens": 64000,
+          "candidate_role": "candidate_interactive_escalation",
+          "qualification_status": "OBSERVED_OPERATIONAL_ON_HOST"
+        }
+      }
+    },
+    "paid-vertex-or-gemini-api-argon": {
+      "provider_id": "vertex-argon-disabled",
+      "official_name": "Paid Gemini 4 Argon (Vertex AI / Gemini API)",
+      "status": "DISABLED_BY_BUDGET_POLICY",
+      "blocker_reason": "Costs $2.00/1M input and $10.00/1M output; not available on Free Tier. Hard-disabled under the $0.00 operational budget.",
+      "models": {
+        "gemini-4-argon": {
+          "exact_model_id": "gemini-4-argon",
+          "cost_per_1m_input_usd": 2.0,
+          "cost_per_1m_output_usd": 10.0,
+          "qualification_status": "BLOCKED_PAID_ROUTE"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""
+omega-policy: Repaired Fail-Closed Execution-Boundary Policy & Approval Engine (v1.3)
+Enforces Section 5 of OMEGA APEX v1.3 Complete Foundation Repair Directive:
+  - Rejects all spoofable CLI approval flags (--human-approved, --approve, --operator-confirm).
+  - Rejects any approval record authored by a model/agent or lacking a verified out-of-band
+    HMAC-SHA256 signature from an external operator key outside the workspace.
+  - Because DSH-Go 0.2.2-rc.1 does not expose a cryptographic host approval socket to PRoot
+    subprocesses, all OP_CONSEQUENTIAL_EXEC and OP_CONSTITUTION_MUTATE requests FAIL CLOSED
+    (decision = "DENY_FAIL_CLOSED") unless an out-of-band operator verifier secret is present
+    at /run/omega_operator_oob.key (owned by root/operator outside workspace) AND a valid,
+    unexpired, unrevoked, single-use nonce-bound ApprovalToken is verified.
+  - PREPARE_ONLY remains strictly intact.
+"""
+from __future__ import annotations
+import datetime as dt
+import hashlib
+import hmac
+import json
+import os
+import sys
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+APPROVALS_PATH = ROOT_DIR / "operations" / "APPROVAL_RECORDS.json"
+CONSUMED_NONCES_PATH = ROOT_DIR / "receipts" / "events" / "CONSUMED_APPROVAL_NONCES.json"
+JOURNAL_PATH = ROOT_DIR / "receipts" / "events" / "POLICY_DECISION_JOURNAL.jsonl"
+
+# Out-of-band key path that an agent confined to the workspace cannot write
+DEFAULT_OOB_KEY_PATH = Path("/run/omega_operator_oob.key")
+
+SPOOF_FLAGS = {
+    "--human-approved",
+    "--approve",
+    "--operator-confirm",
+    "--force-allow",
+    "--bypass-policy",
+    "RATIFY_OR_APPROVE",
+}
+
+PROTECTED_HOST_PATHS = (
+    "/root/.dsh",
+    "/etc",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/sdcard",
+    "/data",
+)
+
+def now_utc() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+def now_iso() -> str:
+    return now_utc().isoformat()
+
+def canonical_proposal_digest(
+    operation_class: str,
+    capability_id: str,
+    target: str,
+    scope: str,
+    expected_effect: str,
+    conditions: str,
+    payload_sha256: str,
+) -> str:
+    canonical = json.dumps({
+        "operation_class": operation_class,
+        "capability_id": capability_id,
+        "target": target,
+        "scope": scope,
+        "expected_effect": expected_effect,
+        "conditions": conditions,
+        "payload_sha256": payload_sha256,
+    }, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+def load_json_dict(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+def save_json_dict(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+def record_decision(entry: dict) -> None:
+    JOURNAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with JOURNAL_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+def is_within_workspace(target_path: str) -> bool:
+    try:
+        resolved = (ROOT_DIR / target_path).resolve() if not os.path.isabs(target_path) else Path(target_path).resolve()
+        resolved.relative_to(ROOT_DIR.resolve())
+        return True
+    except ValueError:
+        return False
+
+def classify_operation(capability_id: str, target: str) -> str:
+    cap_lower = capability_id.lower()
+    if "constitution" in target.lower() or "ratify" in cap_lower or "amend" in cap_lower:
+        return "OP_CONSTITUTION_MUTATE"
+    if any(target.startswith(p) for p in PROTECTED_HOST_PATHS) or not is_within_workspace(target):
+        return "OP_CONSEQUENTIAL_EXEC"
+    if any(k in cap_lower for k in ("install", "uninstall", "deploy", "purchase", "spend", "credential", "chmod", "daemon", "restart")):
+        return "OP_CONSEQUENTIAL_EXEC"
+    if any(k in cap_lower for k in ("write", "edit", "create", "stage", "prepare")):
+        return "OP_PREPARE_WORKSPACE"
+    if any(k in cap_lower for k in ("test", "verify", "eval", "check")):
+        return "OP_SIMULATE_TEST"
+    return "OP_READ_OBSERVE"
+
+def evaluate_execution_boundary(
+    actor: str,
+    mission_id: str,
+    capability_id: str,
+    target: str,
+    scope: str = "workspace",
+    expected_effect: str = "read_or_prepare",
+    conditions: str = "prepare_only",
+    payload_sha256: str = "none",
+    approval_id: str = "",
+    raw_cli_args: list[str] | None = None,
+    oob_key_override: bytes | None = None,
+) -> dict:
+    raw_cli_args = raw_cli_args or []
+    inferred_class = classify_operation(capability_id, target)
+    prop_digest = canonical_proposal_digest(
+        inferred_class, capability_id, target, scope, expected_effect, conditions, payload_sha256
+    )
+
+    # 1. Detect any CLI flag or fixed-phrase approval spoofing attempt
+    for token in raw_cli_args:
+        for spoof in SPOOF_FLAGS:
+            if token == spoof or token.startswith(spoof + "="):
+                res = {
+                    "decision_id": "pol_" + hashlib.sha256(f"{prop_digest}:{now_iso()}".encode()).hexdigest()[:12],
+                    "policy_version": "OAPX-CON-001-v1.1-draft (NOT_RATIFIED)",
+                    "timestamp": now_iso(),
+                    "actor": actor,
+                    "mission_id": mission_id,
+                    "operation_class": inferred_class,
+                    "capability_id": capability_id,
+                    "target": target,
+                    "proposal_digest": prop_digest,
+                    "approval_reference": approval_id or None,
+                    "decision": "DENY_SPOOF_ATTEMPT",
+                    "rationale": f"Rejected spoofable CLI flag or confirmation phrase: '{token}'. Agents cannot self-approve via CLI flags.",
+                }
+                record_decision(res)
+                return res
+
+    # 2. Hard block on any attempt by an agent/model to mutate or ratify the Constitution
+    if inferred_class == "OP_CONSTITUTION_MUTATE":
+        res = {
+            "decision_id": "pol_" + hashlib.sha256(f"{prop_digest}:{now_iso()}".encode()).hexdigest()[:12],
+            "policy_version": "OAPX-CON-001-v1.1-draft (NOT_RATIFIED)",
+            "timestamp": now_iso(),
+            "actor": actor,
+            "mission_id": mission_id,
+            "operation_class": inferred_class,
+            "capability_id": capability_id,
+            "target": target,
+            "proposal_digest": prop_digest,
+            "approval_reference": None,
+            "decision": "INTEGRITY_BLOCK",
+            "rationale": "Article II §2.4 & Article XV §15.1: Models and subsystems may not ratify or amend the Constitution.",
+        }
+        record_decision(res)
+        return res
+
+    # 3. Permitted read-only, simulation, and bounded workspace preparation
+    if inferred_class in ("OP_READ_OBSERVE", "OP_SIMULATE_TEST", "OP_PREPARE_WORKSPACE"):
+        if not is_within_workspace(target):
+            decision = "DENY_OUT_OF_SCOPE"
+            rationale = f"Target '{target}' lies outside the project workspace boundary."
+        else:
+            decision = "ALLOW"
+            rationale = f"Article V §5.1 & §5.7: {inferred_class} inside project workspace is permitted under PREPARE_ONLY."
+        res = {
+            "decision_id": "pol_" + hashlib.sha256(f"{prop_digest}:{now_iso()}".encode()).hexdigest()[:12],
+            "policy_version": "OAPX-CON-001-v1.1-draft (NOT_RATIFIED)",
+            "timestamp": now_iso(),
+            "actor": actor,
+            "mission_id": mission_id,
+            "operation_class": inferred_class,
+            "capability_id": capability_id,
+            "target": target,
+            "proposal_digest": prop_digest,
+            "approval_reference": None,
+            "decision": decision,
+            "rationale": rationale,
+        }
+        record_decision(res)
+        return res
+
+    # 4. Consequential operations (OP_CONSEQUENTIAL_EXEC):
+    #    Fail closed unless an out-of-band operator verifier key exists AND a signed, unexpired,
+    #    unrevoked, unconsumed ApprovalRecord matches the exact proposal_digest.
+    oob_key = oob_key_override
+    if oob_key is None and DEFAULT_OOB_KEY_PATH.exists():
+        try:
+            oob_key = DEFAULT_OOB_KEY_PATH.read_bytes().strip()
+        except OSError:
+            oob_key = None
+
+    if not oob_key:
+        res = {
+            "decision_id": "pol_" + hashlib.sha256(f"{prop_digest}:{now_iso()}".encode()).hexdigest()[:12],
+            "policy_version": "OAPX-CON-001-v1.1-draft (NOT_RATIFIED)",
+            "timestamp": now_iso(),
+            "actor": actor,
+            "mission_id": mission_id,
+            "operation_class": inferred_class,
+            "capability_id": capability_id,
+            "target": target,
+            "proposal_digest": prop_digest,
+            "approval_reference": approval_id or None,
+            "decision": "DENY_FAIL_CLOSED_NO_HOST_APPROVAL_CHANNEL",
+            "rationale": (
+                "Fail-closed under PREPARE_ONLY: DSH-Go 0.2.2-rc.1 does not expose a cryptographic "
+                "out-of-band approval channel to PRoot scripts (/run/omega_operator_oob.key absent). "
+                "Consequential execution is disabled; stage a human implementation proposal instead."
+            ),
+        }
+        record_decision(res)
+        return res
+
+    approvals = load_json_dict(APPROVALS_PATH)
+    app = approvals.get(approval_id)
+    if not app:
+        decision = "DENY_MISSING_APPROVAL"
+        rationale = f"No ApprovalRecord found for ID '{approval_id}'."
+    elif app.get("author_actor") in ("model", "agent", "omega_worker", actor):
+        decision = "DENY_SELF_MANUFACTURED_APPROVAL"
+        rationale = f"ApprovalRecord '{approval_id}' was authored by '{app.get('author_actor')}'; agents cannot manufacture approvals."
+    elif app.get("revoked") is True or app.get("status") != "approved":
+        decision = "DENY_REVOKED_OR_INACTIVE"
+        rationale = f"ApprovalRecord '{approval_id}' has status='{app.get('status')}', revoked={app.get('revoked')}."
+    elif app.get("proposal_digest") != prop_digest:
+        decision = "DENY_PROPOSAL_MISMATCH"
+        rationale = f"ApprovalRecord digest {app.get('proposal_digest')} != requested digest {prop_digest}."
+    else:
+        # Check expiration
+        exp_str = app.get("expires_at", "")
+        try:
+            exp_dt = dt.datetime.fromisoformat(exp_str)
+            expired = now_utc() >= exp_dt
+        except ValueError:
+            expired = True
+
+        # Check replay nonce
+        nonce = app.get("nonce", "")
+        consumed = load_json_dict(CONSUMED_NONCES_PATH)
+        if expired:
+            decision = "DENY_APPROVAL_EXPIRED"
+            rationale = f"ApprovalRecord '{approval_id}' expired at {exp_str}."
+        elif not nonce or nonce in consumed:
+            decision = "DENY_REPLAY_DETECTED"
+            rationale = f"ApprovalRecord nonce '{nonce}' has already been consumed or is missing."
+        else:
+            # Verify HMAC-SHA256 signature over (approval_id | proposal_digest | expires_at | nonce)
+            msg = f"{approval_id}|{prop_digest}|{exp_str}|{nonce}".encode("utf-8")
+            expected_sig = hmac.new(oob_key, msg, hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(expected_sig, str(app.get("oob_hmac_sha256", ""))):
+                decision = "DENY_INVALID_OOB_SIGNATURE"
+                rationale = "Out-of-band HMAC-SHA256 signature verification failed (forged approval record)."
+            else:
+                consumed[nonce] = {"approval_id": approval_id, "consumed_at": now_iso(), "proposal_digest": prop_digest}
+                save_json_dict(CONSUMED_NONCES_PATH, consumed)
+                decision = "ALLOW_VERIFIED_OOB_APPROVAL"
+                rationale = f"Verified out-of-band HMAC signature, scope binding, expiry, and single-use nonce for {approval_id}."
+
+    res = {
+        "decision_id": "pol_" + hashlib.sha256(f"{prop_digest}:{now_iso()}".encode()).hexdigest()[:12],
+        "policy_version": "OAPX-CON-001-v1.1-draft (NOT_RATIFIED)",
+        "timestamp": now_iso(),
+        "actor": actor,
+        "mission_id": mission_id,
+        "operation_class": inferred_class,
+        "capability_id": capability_id,
+        "target": target,
+        "proposal_digest": prop_digest,
+        "approval_reference": approval_id or None,
+        "decision": decision,
+        "rationale": rationale,
+    }
+    record_decision(res)
+    return res
+
+def main() -> None:
+    raw_args = sys.argv[1:]
+    # First check if any raw CLI argument is a spoof flag before argparse even runs
+    for tok in raw_args:
+        for sp in SPOOF_FLAGS:
+            if tok == sp or tok.startswith(sp + "="):
+                res = evaluate_execution_boundary(
+                    actor="cli_caller",
+                    mission_id="MSN-CLI",
+                    capability_id="cli_invocation",
+                    target="unknown",
+                    raw_cli_args=raw_args,
+                )
+                print(json.dumps(res, indent=2))
+                sys.exit(2)
+
+    import argparse
+    parser = argparse.ArgumentParser(description="OMEGA APEX v1.3 Fail-Closed Policy Gateway")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    ev = sub.add_parser("evaluate")
+    ev.add_argument("--actor", default="omega_worker")
+    ev.add_argument("--mission", default="MSN-DEFAULT")
+    ev.add_argument("--capability", required=True)
+    ev.add_argument("--target", required=True)
+    ev.add_argument("--scope", default="workspace")
+    ev.add_argument("--effect", default="read_or_prepare")
+    ev.add_argument("--conditions", default="prepare_only")
+    ev.add_argument("--payload-sha256", default="none")
+    ev.add_argument("--approval-id", default="")
+
+    args = parser.parse_args(raw_args)
+    if args.cmd == "evaluate":
+        res = evaluate_execution_boundary(
+            actor=args.actor,
+            mission_id=args.mission,
+            capability_id=args.capability,
+            target=args.target,
+            scope=args.scope,
+            expected_effect=args.effect,
+            conditions=args.conditions,
+            payload_sha256=args.payload_sha256,
+            approval_id=args.approval_id,
+            raw_cli_args=raw_args,
+        )
+        print(json.dumps(res, indent=2))
+        if not res["decision"].startswith("ALLOW"):
+            sys.exit(2)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,93 @@
+# OMEGA APEX v1.3 — Proposed DSH-Go (0.2.2-rc.1) Patch Configuration
+# Schema: Top-level YAML sequence of id-targeted loader patch entries (matches v6_cordis.patch.yml).
+# Status: PROPOSAL ONLY (PREPARE_ONLY). Do not copy to /root/.dsh/cordis.patch.yml without explicit human operator execution.
+# Note on Token Harbor: Token Harbor ("https://tokenharbor.ai/v1") requires a local TOKENHARBOR_API_KEY
+# credential in /root/.dsh/.credentials.yaml before enabling in llm-pi-ai; see config/provider_integrations.json.
+
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers: {}
+
+- id: subagent
+  name: "@deepseek-ai/dsh-subagent"
+  config:
+    maxDepth: 3
+    maxActiveSubagents: 3
+
+- id: subagent-model-selection-settings
+  name: "@deepseek-ai/dsh-tool-subagent/model-selection-settings"
+  config:
+    enabled: true
+    allowedModels:
+      - provider: our-free-model
+        model: deepseek-v4.1-flash-free
+      - provider: our-free-model
+        model: mimo-v2.6-flash-free
+      - provider: google-antigravity
+        model: antigravity-gemini-3.7-flash
+
+- id: bash-sandbox
+  name: "@deepseek-ai/dsh-bash-sandbox"
+  config:
+    timeoutMs: 120000
+    maxTimeoutMs: 600000
+    maxSpillBytes: 64106816
+    graceMs: 6000
+    maxOutputBytes: 63000
+
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: our-free-model
+    model: mimo-v2.6-flash-free
+    reasoningEffort: high
+    rememberLastSelection: false
+
+- id: permission
+  name: "@deepseek-ai/dsh-permission-presets"
+  config:
+    presets:
+      read-only:
+        sandbox: read-only
+        approval: ask
+      workspace-write:
+        sandbox: workspace-write
+        approval: ask
+      danger-full-access:
+        sandbox: read-only
+        approval: ask
+    defaultPreset: read-only
+
+- id: preset-standard
+  name: "@deepseek-ai/dsh-agent-preset"
+  config:
+    id: standard
+    order: 1
+    plugins:
+      - id: agent-instructions
+        name: "@deepseek-ai/dsh-agent-instructions"
+        config:
+          maxBytes: 131072
+      - id: delegation
+        name: "cordis:group"
+        group: true
+        isolate:
+          workflowEngine: true
+        config:
+          - id: tool-subagent-control
+            name: "@deepseek-ai/dsh-tool-subagent-control"
+          - id: tool-subagent
+            name: "@deepseek-ai/dsh-tool-subagent"
+            config:
+              provider: spawn
+              toolName: subagent
+              modelSelection: true
+              modelDiscovery: false
+          - id: tool-subagent-fork
+            name: "@deepseek-ai/dsh-tool-subagent"
+            config:
+              provider: fork
+              toolName: subagent_fork
+              modelSelection: false
+              modelDiscovery: false

@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""
+omega-resource: Resource Governance, $0 Budget Enforcement & Circuit Breaker Engine (v1.3)
+Enforces Article X §10.1–10.4 & Section 10 of v1.3 Repair Directive:
+  - Enforces operational_budget_ceiling_usd == 0.00 (blocks any route with cost > 0 or paid_route == True).
+  - Explicitly separates `provider_allowance`, `measured_usage`, and `estimated_usage`.
+  - Never claims two model routes have separate quotas unless `separate_per_model_quota_verified == True`.
+  - Trips circuit breaker (`CIRCUIT_OPEN`) after `failure_threshold` consecutive errors on a route.
+"""
+from __future__ import annotations
+import datetime as dt
+import json
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+PROVIDERS_PATH = ROOT_DIR / "config" / "provider_integrations.json"
+RESOURCE_STATE_PATH = ROOT_DIR / "operations" / "RESOURCE_LEDGER.json"
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+def load_providers() -> dict:
+    return json.loads(PROVIDERS_PATH.read_text(encoding="utf-8"))
+
+def load_ledger() -> dict:
+    if not RESOURCE_STATE_PATH.exists():
+        return {"routes": {}, "missions": {}}
+    return json.loads(RESOURCE_STATE_PATH.read_text(encoding="utf-8"))
+
+def save_ledger(data: dict) -> None:
+    RESOURCE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    RESOURCE_STATE_PATH.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+def check_and_allocate_request(
+    mission_id: str,
+    provider_id: str,
+    model_id: str,
+    estimated_tokens: int = 2000,
+    current_parallel: int = 1,
+    max_parallel_allowed: int = 3,
+    max_context_tokens: int = 200000,
+) -> dict:
+    cfg = load_providers()
+    budget_ceiling = float(cfg.get("operational_budget_ceiling_usd", 0.0))
+    prov = cfg.get("providers", {}).get(provider_id)
+    if not prov:
+        return {"allowed": False, "reason": "UNKNOWN_PROVIDER", "detail": f"Provider '{provider_id}' not registered."}
+
+    if prov.get("status") == "DISABLED_BY_BUDGET_POLICY":
+        return {"allowed": False, "reason": "DENIED_ZERO_BUDGET_POLICY", "detail": prov.get("blocker_reason")}
+
+    if prov.get("status") == "BLOCKED":
+        return {"allowed": False, "reason": "BLOCKED_PROVIDER_UNVERIFIED", "detail": prov.get("blocker_reason")}
+
+    model_cfg = prov.get("models", {}).get(model_id)
+    if not model_cfg:
+        return {"allowed": False, "reason": "UNKNOWN_MODEL", "detail": f"Model '{model_id}' not in provider '{provider_id}'."}
+
+    cost_in = float(model_cfg.get("cost_per_1m_input_usd", 0.0))
+    cost_out = float(model_cfg.get("cost_per_1m_output_usd", 0.0))
+    if (cost_in > 0.0 or cost_out > 0.0) and budget_ceiling <= 0.0:
+        return {
+            "allowed": False,
+            "reason": "DENIED_PAID_MODEL_UNDER_ZERO_BUDGET",
+            "detail": f"Model {model_id} costs ${cost_in}/${cost_out} per 1M tokens; current budget ceiling is ${budget_ceiling:.2f}.",
+        }
+
+    if current_parallel > max_parallel_allowed:
+        return {
+            "allowed": False,
+            "reason": "DENIED_PARALLELISM_LIMIT",
+            "detail": f"Requested parallel={current_parallel} exceeds max_parallel_allowed={max_parallel_allowed}.",
+        }
+
+    model_ctx = int(model_cfg.get("context_window_tokens", max_context_tokens))
+    if estimated_tokens > min(max_context_tokens, model_ctx):
+        return {
+            "allowed": False,
+            "reason": "DENIED_CONTEXT_ENVELOPE_EXCEEDED",
+            "detail": f"estimated_tokens={estimated_tokens} exceeds context limit {min(max_context_tokens, model_ctx)}.",
+        }
+
+    ledger = load_ledger()
+    route_key = f"{provider_id}/{model_id}"
+    r_state = ledger["routes"].get(route_key, {
+        "consecutive_failures": 0,
+        "circuit_state": "CLOSED",
+        "measured_requests": 0,
+        "measured_tokens": 0,
+        "estimated_tokens": 0,
+    })
+
+    if r_state["circuit_state"] == "OPEN":
+        return {
+            "allowed": False,
+            "reason": "DENIED_CIRCUIT_BREAKER_OPEN",
+            "detail": f"Route {route_key} circuit breaker is OPEN after {r_state['consecutive_failures']} consecutive failures.",
+        }
+
+    r_state["estimated_tokens"] += estimated_tokens
+    ledger["routes"][route_key] = r_state
+    save_ledger(ledger)
+
+    return {
+        "allowed": True,
+        "route": route_key,
+        "provider_allowance_type": prov.get("quota_structure", {}).get("allowance_type", "unknown"),
+        "separate_per_model_quota_verified": bool(prov.get("quota_structure", {}).get("separate_per_model_quota_verified", False)),
+        "estimated_tokens_reserved": estimated_tokens,
+        "measured_tokens_total": r_state["measured_tokens"],
+        "circuit_state": r_state["circuit_state"],
+    }
+
+def record_route_outcome(
+    provider_id: str,
+    model_id: str,
+    success: bool,
+    measured_tokens: int = 0,
+    failure_threshold: int = 3,
+) -> dict:
+    ledger = load_ledger()
+    route_key = f"{provider_id}/{model_id}"
+    r_state = ledger["routes"].get(route_key, {
+        "consecutive_failures": 0,
+        "circuit_state": "CLOSED",
+        "measured_requests": 0,
+        "measured_tokens": 0,
+        "estimated_tokens": 0,
+    })
+    if success:
+        r_state["consecutive_failures"] = 0
+        r_state["circuit_state"] = "CLOSED"
+        r_state["measured_requests"] += 1
+        r_state["measured_tokens"] += measured_tokens
+    else:
+        r_state["consecutive_failures"] += 1
+        if r_state["consecutive_failures"] >= failure_threshold:
+            r_state["circuit_state"] = "OPEN"
+    r_state["updated_at"] = now_iso()
+    ledger["routes"][route_key] = r_state
+    save_ledger(ledger)
+    return r_state

@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""
+omega-rsi: Proposals-Only Evolution Laboratory Verifier (v1.3)
+Enforces Article XIII §13.1–13.5:
+  - System improvements follow a proposal, evaluation, and human approval process.
+  - OMEGA may prepare a change proposal but MUST NOT silently apply it to production.
+  - The Evolution Laboratory MUST NOT grant itself new permissions, change the approval model,
+    disable controls, or expand its own scope (Article XIII §13.3).
+"""
+from __future__ import annotations
+import json
+import re
+import sys
+
+FORBIDDEN_PATTERNS = [
+    re.compile(r"shell\s*=\s*True"),
+    re.compile(r"approval:\s*never"),
+    re.compile(r"danger-full-access"),
+    re.compile(r"find\s+/root/\.dsh.*-delete"),
+    re.compile(r"--human-approved"),
+]
+
+def evaluate_evolution_proposal(proposal: dict) -> dict:
+    diff_text = str(proposal.get("proposed_diff", ""))
+    violations = [p.pattern for p in FORBIDDEN_PATTERNS if p.search(diff_text)]
+    if proposal.get("expands_permissions") or proposal.get("alters_constitution") or proposal.get("auto_applies_to_production"):
+        violations.append("Article XIII §13.1/13.3 violation: Evolution proposals cannot self-apply, expand permissions, or alter the Constitution.")
+
+    base_score = float(proposal.get("baseline_pass_rate", 0.0))
+    cand_score = float(proposal.get("candidate_pass_rate", 0.0))
+    regressions = int(proposal.get("regression_count", 0))
+
+    qualifies_for_human_review = (cand_score >= base_score) and (regressions == 0) and (len(violations) == 0)
+    return {
+        "proposal_id": proposal.get("proposal_id", "RSI-PROP-UNKNOWN"),
+        "status": "PROPOSAL_READY_FOR_HUMAN_APPROVAL" if qualifies_for_human_review else "REJECTED_BY_LAB_GATE",
+        "auto_applied_to_production": False,
+        "qualifies_for_human_review": qualifies_for_human_review,
+        "violations": violations,
+        "regressions": regressions,
+    }
+
+if __name__ == "__main__":
+    res = evaluate_evolution_proposal(json.loads(sys.argv[1]) if len(sys.argv) > 1 else {})
+    print(json.dumps(res, indent=2))

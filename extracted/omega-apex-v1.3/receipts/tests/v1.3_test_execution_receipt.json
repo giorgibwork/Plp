@@ -1,0 +1,214 @@
+{
+  "suite_version": "1.3.0-OMEGA-APEX",
+  "executed_at": "2026-11-13T14:37:40.785796+00:00",
+  "categories_required": 21,
+  "categories_covered": 21,
+  "total_tests": 23,
+  "passed_tests": 23,
+  "failed_tests": 0,
+  "skipped_tests": 0,
+  "pass_rate": 1.0,
+  "adversarial_tests_total": 13,
+  "adversarial_tests_passed": 13,
+  "adversarial_pass_rate": 1.0,
+  "known_host_blockers": [
+    {
+      "blocker_id": "BLK-HOST-01",
+      "component": "Token Harbor (mimo-v2.6-flash:free, deepseek-v4.1-flash:free)",
+      "status": "BLOCKED",
+      "reason": "Requires user-provisioned TOKENHARBOR_API_KEY in local /root/.dsh/.credentials.yaml or environment and on-device live network check."
+    },
+    {
+      "blocker_id": "BLK-HOST-02",
+      "component": "DSH-Go Out-of-Band Cryptographic Approval Bridge",
+      "status": "FAIL_CLOSED_BY_DESIGN",
+      "reason": "DSH-Go 0.2.2-rc.1 does not expose a cryptographic hardware/UI approval socket to PRoot scripts; omega-policy fails closed (DENY) on consequential operations."
+    }
+  ],
+  "records": [
+    {
+      "category_id": "C01_config_parsing",
+      "test_name": "parse_all_project_yaml_and_json",
+      "adversarial": false,
+      "status": "PASSED",
+      "passed": true,
+      "detail": "Parsed 2 YAML files and 7 JSON files cleanly."
+    },
+    {
+      "category_id": "C01_config_parsing",
+      "test_name": "reject_malformed_unquoted_at_yaml",
+      "adversarial": true,
+      "status": "PASSED",
+      "passed": true,
+      "detail": "Correctly caught malformed unquoted '@' YAML (ScannerError)."
+    },
+    {
+      "category_id": "C02_dependency_and_module_resolution",
+      "test_name": "verify_all_cli_modules_and_ast",
+      "adversarial": false,
+      "status": "PASSED",
+      "passed": true,
+      "detail": "All 8 core executables exist, have +x mode, and pass Python AST compilation."
+    },
+    {
+      "category_id": "C03_dsh_integration_compatibility",
+      "test_name": "validate_cordis_patch_list_schema",
+      "adversarial": false,
+      "status": "PASSED",
+      "passed": true,
+      "detail": "cordis.patch.yml is a valid 7-entry Cordis patch list with fail-closed read-only defaultPreset."
+    },
+    {
+      "category_id": "C04_policy_enforcement",
+      "test_name": "enforce_read_prepare_consequential_and_constitutional_boundaries",
+      "adversarial": false,
+      "status": "PASSED",
+      "passed": true,
+      "detail": "Decisions: read=ALLOW, prep=ALLOW, cons=DENY_FAIL_CLOSED_NO_HOST_APPROVAL_CHANNEL, const=INTEGRITY_BLOCK"
+    },
+    {
+      "category_id": "C05_approval_spoofing_attempts",
+      "test_name": "reject_cli_spoof_flags_and_phrases",
+      "adversarial": true,
+      "status": "PASSED",
+      "passed": true,
+      "detail": "Rejected all 4 CLI flag / confirmation-phrase spoofing patterns with DENY_SPOOF_ATTEMPT."
+    },
+    {
+      "category_id": "C05_approval_spoofing_attempts",
+      "test_name": "reject_agent_self_authored_approval_record",
+      "adversarial": true,
+      "status": "PASSED",
+      "passed": true,
+      "detail": "Self-authored approval result: DENY_SELF_MANUFACTURED_APPROVAL"
+    },
+    {
+      "category_id": "C06_unauthorized_action_denial",
+      "test_name": "deny_host_and_path_traversal_targets",
+      "adversarial": true,
+      "status": "PASSED",
+      "passed": true,
+      "detail": "Outside workspace decisions: /root/.dsh=DENY_FAIL_CLOSED_NO_HOST_APPROVAL_CHANNEL, ../escape=DENY_FAIL_CLOSED_NO_HOST_APPROVAL_CHANNEL"
+    },
+    {
+      "category_id": "C07_ticket_tampering",
+      "test_name": "detect_mutated_ticket_contract_fields",
+      "adversarial": true,
+      "status": "PASSED",
+      "passed": true,
+      "detail": "Detected tamper: TICKET_TAMPER_DETECTED on TKT-TEST-07: stored digest sha256:0b8ecab357a52fbd2059de5373c41f9a850e26aca2ac38d233a89fc55ffac83c != computed sha256:a9f887e4dc53f0e7e7aca579646c8c99056dd66389cee4f2579a370627e8c157"
+    },
+    {
+      "category_id": "C08_command_injection",
+      "test_name": "block_string_checks_and_injected_paths",
+      "adversarial": true,
+      "status": "PASSED",
+      "passed": true,
+      "detail": "Raw string check=False (REJECTED_UNTYPED_CHECK: typed_success_check must be a structured dict, never a raw shell string.); metacharacter ticket creation blocked=True"
+    },
+    {
+      "category_id": "C09_shell_metacharacter_handling",
+      "test_name": "ast_verify_zero_shell_true_across_all_scripts",
+      "adversarial": false,
+      "status": "PASSED",
+      "passed": true,
+      "detail": "AST scan across 11 executables/scripts confirmed 0 occurrences of shell=True."
+    },
+    {
+      "category_id": "C10_approval_expiry_and_replay",
+      "test_name": "enforce_oob_signature_expiry_revocation_and_replay",
+      "adversarial": true,
+      "status": "PASSED",
+      "passed": true,
+      "detail": "first=ALLOW_VERIFIED_OOB_APPROVAL, replay=DENY_REPLAY_DETECTED, expired=DENY_APPROVAL_EXPIRED, revoked=DENY_REVOKED_OR_INACTIVE"
+    },
+    {
+      "category_id": "C11_mission_state_integrity",
+      "test_name": "block_delegate_authority_escalation_and_objective_tamper",
+      "adversarial": true,
+      "status": "PASSED",
+      "passed": true,
+      "detail": "Delegate T1->T3 escalation blocked=True"
+    },
+    {
+      "category_id": "C12_memory_provenance",
+      "test_name": "enforce_9_truth_categories_and_anti_repetition_law",
+      "adversarial": true,
+      "status": "PASSED",
+      "passed": true,
+      "detail": "After 4 repetitions category=assumed (rep_count=4); injection=QUARANTINED"
+    },
+    {
+      "category_id": "C13_independent_verification",
+      "test_name": "reject_same_actor_self_verification",
+      "adversarial": true,
+      "status": "PASSED",
+      "passed": true,
+      "detail": "Self-verification=REJECTED_SELF_VERIFICATION; independent-verification=STORED"
+    },
+    {
+      "category_id": "C14_false_completion",
+      "test_name": "block_unverified_state_transition_and_failed_artifact",
+      "adversarial": true,
+      "status": "PASSED",
+      "passed": true,
+      "detail": "Direct transition blocked=True; failed check state=FAILED"
+    },
+    {
+      "category_id": "C15_resource_limit_enforcement",
+      "test_name": "enforce_zero_budget_parallelism_and_context_caps",
+      "adversarial": true,
+      "status": "PASSED",
+      "passed": true,
+      "detail": "paid=DENIED_ZERO_BUDGET_POLICY, parallel=DENIED_PARALLELISM_LIMIT, ctx=DENIED_CONTEXT_ENVELOPE_EXCEEDED, valid_free=True"
+    },
+    {
+      "category_id": "C16_bounded_retries",
+      "test_name": "transition_to_blocked_when_max_retries_exceeded",
+      "adversarial": false,
+      "status": "PASSED",
+      "passed": true,
+      "detail": "Retry states: attempt1=FAILED, attempt2=FAILED, attempt3=BLOCKED"
+    },
+    {
+      "category_id": "C17_recovery_and_checkpoint_continuity",
+      "test_name": "prevent_duplicate_step_nonce_and_reconcile_checkpoint",
+      "adversarial": false,
+      "status": "PASSED",
+      "passed": true,
+      "detail": "Duplicate step nonce blocked=True; reconciled state=VERIFIED"
+    },
+    {
+      "category_id": "C18_provider_failures_and_unavailable_models",
+      "test_name": "block_unkeyed_token_harbor_and_trip_circuit_breaker",
+      "adversarial": false,
+      "status": "PASSED",
+      "passed": true,
+      "detail": "TokenHarbor=BLOCKED_PROVIDER_UNVERIFIED; after 3 failures circuit=DENIED_CIRCUIT_BREAKER_OPEN"
+    },
+    {
+      "category_id": "C19_model_disagreement",
+      "test_name": "preserve_unresolved_dispute_and_resolve_by_evidence",
+      "adversarial": false,
+      "status": "PASSED",
+      "passed": true,
+      "detail": "Unverified disagreement=UNRESOLVED_DISPUTE_PRESERVED; evidence-backed=RESOLVED_BY_EVIDENCE_B"
+    },
+    {
+      "category_id": "C20_conflicting_instructions",
+      "test_name": "enforce_article_iv_7_level_instruction_precedence",
+      "adversarial": true,
+      "status": "PASSED",
+      "passed": true,
+      "detail": "Const vs untrusted -> 1_ratified_constitution; Human vs model plan -> 2_current_human_instruction"
+    },
+    {
+      "category_id": "C21_prepare_only_enforcement",
+      "test_name": "verify_prepare_only_non_ratified_status_and_archive_isolation",
+      "adversarial": false,
+      "status": "PASSED",
+      "passed": true,
+      "detail": "Active STAIR sections=289 (leaked_archived=0); NOT_RATIFIED=True"
+    }
+  ]
+}
